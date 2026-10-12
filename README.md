@@ -7,6 +7,37 @@ ready-to-use patched DLL download. RootsMagic is proprietary; obtain your own
 installer and license. This is an independent, unsupported compatibility
 experiment, not an official RootsMagic or Wine project.
 
+## Easiest way to follow this guide with a CLI AI agent
+
+If you use an AI coding agent in a terminal, give it this repository and your
+own RootsMagic installer files. It can inspect your machine, build the patches,
+and guide the installation rather than having you manually translate every Wine
+path and command. For example, paste this request into your agent:
+
+> Help me install my licensed RootsMagic 11 and/or 12 on Linux using Wine and
+> https://github.com/rodhuffaker/rootsmagic-wine-patches. Read the entire README
+> first. Inspect my current Wine setup and the installers I provide; identify
+> each application's 32- or 64-bit architecture. Do not overwrite my system
+> Wine, existing prefixes, launchers, or genealogy databases. Download the
+> official Wine 11.17 source archive and verify its checksum, run `build.sh`,
+> stage the resulting DLLs in a new private runtime with `stage-runtime.sh`,
+> and run `test-probes.py` in an isolated prefix. For RM12 Browse, use only a
+> verified x64 version-6 `comctl32.dll` from my own Wine prefix if available;
+> it is not supplied by this repository. Install my own RootsMagic installer
+> into the test prefix, set 192 DPI if I use 200% scaling, use Vulkan for RM11
+> and test OpenGL for RM12, then check the actual UI and file picker with a
+> disposable tree. Let me handle registration and FamilySearch sign-in myself.
+> Ask before changing my daily-use setup or accessing a real database. Report
+> what passed and what remains untested; do not claim the patches were rebuilt
+> against Wine 11.19 source or that all features work everywhere.
+
+An agent is a helper, not a one-command installer: review its proposed changes
+and make it verify each result. Never paste license keys, passwords, genealogy
+files, or raw authentication logs into a chat or public issue. The repository
+contains source patches and scripts, **not** the RootsMagic installer, the
+version-6 common-controls DLL, or an automatically validated setup for your
+machine.
+
 ## What was tested
 
 * Linux Mint 22.3 (x86_64); RootsMagic 11 (32-bit) and RootsMagic 12 (64-bit).
