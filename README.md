@@ -26,10 +26,16 @@ path and command. For example, paste this request into your agent:
 > it is not supplied by this repository. Install my own RootsMagic installer
 > into the test prefix, set 192 DPI if I use 200% scaling, use Vulkan for RM11
 > and test OpenGL for RM12, then check the actual UI and file picker with a
-> disposable tree. Let me handle registration and FamilySearch sign-in myself.
-> Ask before changing my daily-use setup or accessing a real database. Report
-> what passed and what remains untested; do not claim the patches were rebuilt
-> against Wine 11.19 source or that all features work everywhere.
+> disposable tree. Once that version passes, create a separate launcher script and
+> Desktop `.desktop` icon for it, pointing to the tested private Wine runner,
+> prefix, executable and per-version renderer (Vulkan for RM11, OpenGL for RM12).
+> Do not replace an existing icon without asking. Validate the desktop entry,
+> launch it from the icon, and verify it still opens the app and RM12's Browse
+> picker—not just from a terminal. Let me handle registration and FamilySearch
+> sign-in myself. Ask before changing my daily-use setup or accessing a real
+> database. Report what passed and what remains untested; do not claim the
+> patches were rebuilt against Wine 11.19 source or that all features work
+> everywhere.
 
 An agent is a helper, not a one-command installer: review its proposed changes
 and make it verify each result. Never paste license keys, passwords, genealogy
