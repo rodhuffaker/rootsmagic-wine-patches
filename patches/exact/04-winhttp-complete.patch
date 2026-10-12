@@ -1,0 +1,79 @@
+--- a/dlls/winhttp/request.c
++++ b/dlls/winhttp/request.c
+@@ -40,6 +40,14 @@
+ #include "winhttp_private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(winhttp);
++
++/* Opt-in metadata only: never log URLs, headers, credentials, or bodies. */
++static BOOL rm_http_diagnostic(void)
++{
++    WCHAR enabled[2];
++    return GetEnvironmentVariableW(L"ROOTSMAGIC_HTTP_DIAGNOSTIC", enabled, 2) == 1
++        && enabled[0] == '1';
++}
+ 
+ #define DEFAULT_KEEP_ALIVE_TIMEOUT 30000
+ 
+@@ -2249,6 +2257,22 @@
+         if (!wcsicmp( connection, L"close" )) close_request_headers = TRUE;
+     }
+ 
++    /* inflate can finish before the chunked parent consumes its final framing.
++     * Such a socket must not enter the connection pool: the next response
++     * parser would see leftover chunk bytes instead of an HTTP status line.
++     * Close it rather than adding a blocking drain to successful body reads. */
++    if (request->data_stream->vtbl == &gzip_stream_vtbl)
++    {
++        struct gzip_stream *gzip = (struct gzip_stream *)request->data_stream;
++        if (gzip->parent->vtbl == &chunked_stream_vtbl &&
++            !gzip->parent->vtbl->end_of_data(gzip->parent, request))
++        {
++            close = TRUE;
++            if (rm_http_diagnostic())
++                WARN("RM_HTTP closing connection with unread chunk framing request=%p\n", request);
++        }
++    }
++
+     if (close || close_request_headers)
+     {
+         if (close_request_headers) send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_CLOSING_CONNECTION, 0, 0 );
+@@ -2564,6 +2588,9 @@
+     send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_REQUEST_SENT, &len, sizeof(len) );
+ 
+ end:
++    if (rm_http_diagnostic())
++        WARN("RM_HTTP send request=%p host=%s error=%lu\n",
++             request, debugstr_w(request->connect->hostname), ret);
+     if (async)
+     {
+         if (!ret) send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE, NULL, 0 );
+@@ -3271,6 +3298,10 @@
+     query = WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER;
+     if ((ret = query_headers( request, query, NULL, &status, &size, NULL ))) goto done;
+ 
++    if (rm_http_diagnostic())
++        WARN("RM_HTTP response request=%p host=%s status=%lu\n",
++             request, debugstr_w(request->connect->hostname), status);
++
+     if ((ret = set_content_length( request, status ))) goto done;
+ 
+     if (!(request->hdr.disable_flags & WINHTTP_DISABLE_COOKIES)) record_cookies( request );
+@@ -3306,6 +3337,8 @@
+     return async ? queue_receive_response( request ) : receive_response( request );
+ 
+ done:
++    if (rm_http_diagnostic())
++        WARN("RM_HTTP receive request=%p error=%lu\n", request, ret);
+     if (!ret)
+     {
+         request->state = REQUEST_STATE_RESPONSE_RECEIVED;
+@@ -3509,6 +3542,8 @@
+         size -= count;
+     }
+ 
++    if (rm_http_diagnostic())
++        WARN("RM_HTTP read request=%p bytes=%lu error=%lu\n", request, bytes_read, ret);
+     TRACE( "%lu bytes read\n", bytes_read );
+     if (end_of_data_stream( request )) finished_reading( request );
+     if (async)

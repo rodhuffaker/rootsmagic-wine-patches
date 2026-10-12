@@ -1,0 +1,286 @@
+--- a/dlls/dwrite/layout.c
++++ b/dlls/dwrite/layout.c
+@@ -4498,10 +4498,123 @@
+     UINT32 textPosition, UINT32 textLength, FLOAT originX, FLOAT originY,
+     DWRITE_HIT_TEST_METRICS *metrics, UINT32 max_metricscount, UINT32* actual_metricscount)
+ {
+-    FIXME("%p, %u, %u, %f, %f, %p, %u, %p): stub\n", iface, textPosition, textLength, originX, originY, metrics,
+-        max_metricscount, actual_metricscount);
+-
+-    return E_NOTIMPL;
++    struct dwrite_textlayout *layout = impl_from_IDWriteTextLayout4(iface);
++    DWRITE_HIT_TEST_METRICS box, pending = {0};
++    struct layout_effective_run *run;
++    struct layout_line *pending_line = NULL;
++    UINT32 end, count = 0;
++    BOOL have_pending = FALSE;
++    HRESULT hr;
++
++    TRACE("%p, %u, %u, %f, %f, %p, %u, %p.\n", iface, textPosition, textLength,
++            originX, originY, metrics, max_metricscount, actual_metricscount);
++
++    if (!actual_metricscount)
++        return E_INVALIDARG;
++    *actual_metricscount = 0;
++    if (!metrics && max_metricscount)
++        return E_INVALIDARG;
++    if (FAILED(hr = layout_compute_effective_runs(layout)))
++        return hr;
++
++    textPosition = min(textPosition, layout->length);
++    end = textPosition + min(textLength, layout->length - textPosition);
++    if (end == textPosition)
++    {
++        FLOAT x, y;
++        if (FAILED(hr = dwritetextlayout_HitTestTextPosition(iface, textPosition, FALSE, &x, &y, &box)))
++            return hr;
++        box.textPosition = textPosition;
++        box.length = 0;
++        box.left = x + originX;
++        box.top += originY;
++        box.width = 0.0f;
++        if (max_metricscount)
++            metrics[0] = box;
++        *actual_metricscount = 1;
++        return max_metricscount ? S_OK : E_NOT_SUFFICIENT_BUFFER;
++    }
++
++    /* Effective runs are in logical text order. Keep separate boxes at line,
++     * direction and inline-object boundaries, but not at formatting changes. */
++    LIST_FOR_EACH_ENTRY(run, &layout->effective_runs, struct layout_effective_run, entry)
++    {
++        UINT32 start = max(textPosition, run->start_position);
++        UINT32 stop = min(end, run->start_position + run->length);
++        FLOAT leading = 0.0f, width = 0.0f;
++
++        if (start >= stop)
++            continue;
++        if (run->object)
++        {
++            start = run->start_position;
++            stop = start + run->length;
++            width = run->width;
++        }
++        else
++        {
++            UINT32 cluster = run->first_cluster, cursor = run->start_position;
++            while (cursor < run->start_position + run->length && cluster < layout->cluster_count)
++            {
++                const DWRITE_CLUSTER_METRICS *cm = &layout->clustermetrics[cluster++];
++                UINT32 next = cursor + cm->length;
++                if (next <= start)
++                    leading += cm->width;
++                else if (cursor < stop)
++                {
++                    /* Include the whole shaping cluster for a partial selection. */
++                    start = min(start, cursor);
++                    stop = max(stop, next);
++                    width += cm->width;
++                }
++                if (next <= cursor || next >= stop)
++                    break;
++                cursor = next;
++            }
++        }
++        box.textPosition = start;
++        box.length = stop - start;
++        box.bidiLevel = run->bidi_level;
++        box.isText = run->trimming || !run->object;
++        box.isTrimmed = run->trimming;
++        box.left = run->left + run->align_dx + originX;
++        box.left += (box.bidiLevel & 1) ? run->width - leading - width : leading;
++        box.top = run->origin.y - run->line->baseline + originY;
++        box.width = width;
++        box.height = run->line->metrics.height;
++
++        if (have_pending && pending_line == run->line && pending.bidiLevel == box.bidiLevel
++                && pending.isText == box.isText && pending.isTrimmed == box.isTrimmed
++                && pending.textPosition + pending.length == box.textPosition
++                && (fabsf(pending.left + pending.width - box.left) < 0.01f
++                    || fabsf(box.left + box.width - pending.left) < 0.01f))
++        {
++            FLOAT right = max(pending.left + pending.width, box.left + box.width);
++            pending.left = min(pending.left, box.left);
++            pending.width = right - pending.left;
++            pending.length += box.length;
++        }
++        else
++        {
++            if (have_pending)
++            {
++                if (count < max_metricscount)
++                    metrics[count] = pending;
++                ++count;
++            }
++            pending = box;
++            pending_line = run->line;
++            have_pending = TRUE;
++        }
++    }
++    if (have_pending)
++    {
++        if (count < max_metricscount)
++            metrics[count] = pending;
++        ++count;
++    }
++    *actual_metricscount = count;
++    return count <= max_metricscount ? S_OK : E_NOT_SUFFICIENT_BUFFER;
+ }
+ 
+ static HRESULT WINAPI dwritetextlayout1_SetPairKerning(IDWriteTextLayout4 *iface, BOOL is_pairkerning_enabled,
+--- a/dlls/dwrite/tests/layout.c
++++ b/dlls/dwrite/tests/layout.c
+@@ -7286,7 +7286,6 @@
+     /* Start index exceeding layout text length, dummy range returned. */
+     count = 0;
+     hr = IDWriteTextLayout_HitTestTextRange(layout, 7, 10, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ if (SUCCEEDED(hr))
+ {
+@@ -7298,7 +7297,6 @@
+     /* Length exceeding layout text length, trimmed. */
+     count = 0;
+     hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 10, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ if (SUCCEEDED(hr))
+ {
+@@ -7315,7 +7313,6 @@
+ 
+     count = 0;
+     hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 6, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ if (SUCCEEDED(hr))
+ {
+@@ -7337,7 +7334,6 @@
+ 
+     count = 0;
+     hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 6, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ if (SUCCEEDED(hr))
+ {
+@@ -7351,7 +7347,6 @@
+ }
+     count = 0;
+     hr = IDWriteTextLayout_HitTestTextRange(layout, 7, 10, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ if (SUCCEEDED(hr))
+ {
+@@ -7364,6 +7359,97 @@
+     IDWriteTextLayout_Release(layout);
+     IDWriteTextFormat_Release(format);
+ 
++    IDWriteFactory_Release(factory);
++}
++
++static void test_HitTestTextRange_buffers(void)
++{
++    IDWriteFactory *factory = create_factory();
++    IDWriteTextFormat *format;
++    IDWriteTextLayout *layout;
++    DWRITE_HIT_TEST_METRICS boxes[8], shifted[8], point;
++    UINT32 count, count2, i;
++    FLOAT x, y;
++    HRESULT hr;
++
++    hr = IDWriteFactory_CreateTextFormat(factory, L"Arial", NULL, DWRITE_FONT_WEIGHT_NORMAL,
++            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16, L"en-us", &format);
++    ok(hr == S_OK, "Create format %#lx.\n", hr);
++    hr = IDWriteFactory_CreateTextLayout(factory, L"Settings sample", 15, format, 400, 200, &layout);
++    ok(hr == S_OK, "Create layout %#lx.\n", hr);
++    count = 0x41800000;
++    hr = IDWriteTextLayout_HitTestTextRange(layout, 9, 1, 0, 0, NULL, 0, &count);
++    ok(hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER), "Sizing hr %#lx.\n", hr);
++    ok(count == 1, "Sizing count %u.\n", count);
++    hr = IDWriteTextLayout_HitTestTextRange(layout, 9, 1, 0, 0, boxes, 1, &count);
++    ok(hr == S_OK && count == 1, "Fill hr %#lx count %u.\n", hr, count);
++    hr = IDWriteTextLayout_HitTestTextPosition(layout, 9, FALSE, &x, &y, &point);
++    ok(hr == S_OK, "Point hr %#lx.\n", hr);
++    ok(boxes[0].left == point.left && boxes[0].width == point.width,
++            "Single character geometry differs.\n");
++    hr = IDWriteTextLayout_HitTestTextRange(layout, 9, 1, 17, 23, shifted, 1, &count2);
++    ok(hr == S_OK && count2 == count, "Offset hr %#lx count %u.\n", hr, count2);
++    ok(shifted[0].left == boxes[0].left + 17 && shifted[0].top == boxes[0].top + 23,
++            "Missing origin offset.\n");
++    IDWriteTextLayout_Release(layout);
++
++    hr = IDWriteFactory_CreateTextLayout(factory, L"abc\ndef", 7, format, 400, 200, &layout);
++    ok(hr == S_OK, "Multiline layout %#lx.\n", hr);
++    count = 0xdeadbeef;
++    hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 7, 0, 0, NULL, 0, &count);
++    ok(hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && count == 2,
++            "Multiline sizing %#lx count %u.\n", hr, count);
++    memset(boxes, 0xcc, sizeof(boxes));
++    hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 7, 0, 0, boxes, 1, &count);
++    ok(hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && count == 2,
++            "Short buffer %#lx count %u.\n", hr, count);
++    ok(boxes[1].textPosition == 0xcccccccc, "Wrote beyond supplied capacity.\n");
++    hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 7, 0, 0, boxes, 8, &count);
++    ok(hr == S_OK && count == 2, "Multiline fill %#lx count %u.\n", hr, count);
++    ok(boxes[1].top > boxes[0].top, "Lines not vertically separated.\n");
++    IDWriteTextLayout_Release(layout);
++
++    hr = IDWriteFactory_CreateTextLayout(factory, L"\x05d0\x05d1\x05d2", 3, format, 400, 200, &layout);
++    ok(hr == S_OK, "RTL layout %#lx.\n", hr);
++    hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 3, 0, 0, boxes, 8, &count);
++    ok(hr == S_OK && count == 1, "RTL range %#lx count %u.\n", hr, count);
++    ok((boxes[0].bidiLevel & 1) && boxes[0].width > 0, "Invalid RTL box.\n");
++    for (i = 0; i < 3; ++i)
++    {
++        hr = IDWriteTextLayout_HitTestTextRange(layout, i, 1, 0, 0, shifted, 8, &count2);
++        ok(hr == S_OK && count2 == 1, "RTL character %#lx count %u.\n", hr, count2);
++        hr = IDWriteTextLayout_HitTestTextPosition(layout, i, FALSE, &x, &y, &point);
++        ok(hr == S_OK && shifted[0].left == point.left && shifted[0].width == point.width,
++                "RTL character %u geometry differs.\n", i);
++    }
++    IDWriteTextLayout_Release(layout);
++    hr = IDWriteFactory_CreateTextLayout(factory, L"one two three four", 18, format, 40, 200, &layout);
++    ok(hr == S_OK, "Wrapped layout %#lx.\n", hr);
++    hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 18, 0, 0, boxes, 8, &count);
++    ok(hr == S_OK && count > 1 && count <= 8, "Wrapped range %#lx count %u.\n", hr, count);
++    count2 = 0;
++    for (i = 0; i < min(count, 8); ++i)
++    {
++        ok(boxes[i].textPosition == count2, "Wrapped coverage starts at %u, expected %u.\n",
++                boxes[i].textPosition, count2);
++        count2 += boxes[i].length;
++        if (i) ok(boxes[i].top > boxes[i - 1].top, "Wrapped line top did not advance.\n");
++    }
++    ok(count2 == 18, "Wrapped coverage %u.\n", count2);
++    hr = IDWriteTextLayout_HitTestTextRange(layout, ~0u, ~0u, 0, 0, boxes, 8, &count);
++    ok(hr == S_OK && count == 1 && boxes[0].textPosition == 18 && !boxes[0].length,
++            "Overflow range %#lx count %u.\n", hr, count);
++    hr = IDWriteTextLayout_HitTestTextRange(layout, 2, 0, 0, 0, boxes, 8, &count);
++    ok(hr == S_OK && count == 1 && !boxes[0].length && !boxes[0].width,
++            "Zero-length range %#lx count %u.\n", hr, count);
++    IDWriteTextLayout_Release(layout);
++    hr = IDWriteFactory_CreateTextLayout(factory, L"", 0, format, 400, 200, &layout);
++    ok(hr == S_OK, "Empty layout %#lx.\n", hr);
++    hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 0, 0, 0, boxes, 8, &count);
++    ok(hr == S_OK && count == 1 && !boxes[0].length && !boxes[0].width,
++            "Empty range %#lx count %u.\n", hr, count);
++    IDWriteTextLayout_Release(layout);
++    IDWriteTextFormat_Release(format);
+     IDWriteFactory_Release(factory);
+ }
+ 
+@@ -7932,6 +8018,15 @@
+ 
+     if (!(factory = create_factory())) {
+         win_skip("failed to create factory\n");
++        return;
++    }
++
++    if (getenv("RM_HITTEST_ONLY"))
++    {
++        test_HitTestTextRange();
++        test_HitTestTextRange_buffers();
++        test_HitTestTextPosition();
++        IDWriteFactory_Release(factory);
+         return;
+     }
+ 

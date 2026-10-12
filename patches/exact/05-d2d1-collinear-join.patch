@@ -1,0 +1,15 @@
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -2929,6 +2929,12 @@ static BOOL d2d_geometry_outline_add_join(struct d2d_geometry *geometry,
+     size_t base_idx;
+     float ccw;
+ 
++    /* A straight-through vertex needs no join. The collinear fallback below
++     * extends 25 units past the vertex and creates a visible tail otherwise. */
++    ccw = d2d_point_ccw(&origin, prev, next);
++    if (ccw == 0.0f && d2d_point_dot(prev, next) < 0.0f)
++        return TRUE;
++
+     if (!d2d_array_reserve((void **)&geometry->outline.vertices, &geometry->outline.vertices_size,
+             geometry->outline.vertex_count + 4, sizeof(*geometry->outline.vertices)))
+     {

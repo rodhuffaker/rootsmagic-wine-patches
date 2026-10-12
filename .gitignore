@@ -1,0 +1,20 @@
+# Local and generated files never belong in this source-only repository.
+*.dll
+*.exe
+*.so
+*.deb
+*.tar.gz
+*.tar.xz
+*.rmtree
+*.rmbackup
+*.log
+*.png
+*.jpg
+__pycache__/
+*.pyc
+build/
+dist/
+prefix/
+runtime/
+.env
+.env.*

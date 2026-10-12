@@ -1,0 +1,391 @@
+--- a/dlls/dxgi/swapchain.c
++++ b/dlls/dxgi/swapchain.c
+@@ -23,9 +23,226 @@
+ #define VKD3D_NO_WIN32_TYPES
+ #include "wine/vulkan.h"
+ #include <vkd3d.h>
++#include <stdio.h>
++
++extern struct wined3d_resource * CDECL wined3d_texture_get_resource(struct wined3d_texture *texture);
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dxgi);
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
++static unsigned int fmx_backbuffer_dump_count;
++static struct wined3d_texture *fmx_staging_texture;
++static struct wined3d_resource *fmx_staging_resource;
++static struct wined3d_device *fmx_staging_device;
++static unsigned int fmx_staging_width, fmx_staging_height;
++static enum wined3d_format_id fmx_staging_format;
++static ULONGLONG fmx_present_request_tick;
++struct fmx_window
++{
++    WNDPROC original_proc;
++    BYTE *frame;
++    SIZE_T frame_size;
++    unsigned int width, height, callbacks;
++    BOOL painting, destroyed, present_pending;
++};
++static const WCHAR fmx_window_property[] = L"RootsMagic.DXGI.FrameState";
++/* FireMonkey can dispatch a paint mid-way through switching tabs, before the
++ * old tab's panel has been hidden, producing one frame that composites both
++ * the old and new view (see FAMILY-VIEW-AUDIT.md, 2026-09-17). Rather than
++ * blit every backbuffer readback to the screen immediately, debounce: wait
++ * for a quiet period after the last Present() before actually presenting,
++ * so a burst of rapid frames only ever shows its last (settled) one. A lone,
++ * non-bursty frame still gets a short delay to catch back-to-back frames,
++ * but nothing worth calling "input lag".
++ *
++ * Some content (e.g. the tab bar) turned out not to be stale-content overlap
++ * but FireMonkey's own layout not finishing synchronously with the paint,
++ * only completing as the app's message loop keeps getting pumped (2026-09-17
++ * live validation). Two rounds of actively nudging the app with synthetic
++ * WM_MOUSEMOVE deltas (single, then chained up to 4x) were both tried and
++ * measured live: neither helped (44 of 45 chained-nudge attempts exhausted
++ * the whole 4-attempt budget without ever producing a new frame, and the
++ * stale-content rate didn't improve). Injecting synthetic messages may
++ * simply be competing with whatever the app's own idle-triggered completion
++ * logic needs, rather than helping it. So instead of nudging, this now just
++ * waits passively for a longer quiet period -- FMX_GDI_PRESENT_BURST_MS was
++ * 80ms; not yet validated whether a longer wait actually helps completion,
++ * this is the next thing to measure. */
++#define FMX_GDI_PRESENT_TIMER 0xF3A9
++#define FMX_GDI_PRESENT_DEBOUNCE_BURST_MS 300
++#define FMX_GDI_PRESENT_DEBOUNCE_IDLE_MS 16
++#define FMX_GDI_PRESENT_BURST_WINDOW_MS 150
++
++static void WINAPI fmx_staging_destroyed(void *parent)
++{
++}
++
++static const struct wined3d_parent_ops fmx_staging_parent_ops = {fmx_staging_destroyed};
++
++static BOOL fmx_gdi_present_enabled(void)
++{
++    char value[8];
++
++    return GetEnvironmentVariableA("ROOTSMAGIC_GDI_PRESENT", value, sizeof(value))
++            && value[0] && value[0] != '0';
++}
++
++static BOOL fmx_gdi_repaint_enabled(void)
++{
++    char value[8];
++
++    return GetEnvironmentVariableA("ROOTSMAGIC_GDI_REPAINT", value, sizeof(value))
++            && value[0] && value[0] != '0';
++}
++
++static void fmx_gdi_present(HWND hwnd, unsigned int source_width, unsigned int source_height,
++        const void *pixels)
++{
++    BITMAPINFO bmi = {0};
++    RECT client_rect;
++    HDC dc;
++    int width, height;
++
++    if (!hwnd || !IsWindowVisible(hwnd) || IsIconic(hwnd))
++        return;
++    if (!GetClientRect(hwnd, &client_rect))
++    {
++        WARN("Failed to get target window client rect.\n");
++        return;
++    }
++
++    width = client_rect.right - client_rect.left;
++    height = client_rect.bottom - client_rect.top;
++    if (width <= 1 || height <= 1)
++        return;
++
++    bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
++    bmi.bmiHeader.biWidth = source_width;
++    bmi.bmiHeader.biHeight = -(LONG)source_height;
++    bmi.bmiHeader.biPlanes = 1;
++    bmi.bmiHeader.biBitCount = 32;
++    bmi.bmiHeader.biCompression = BI_RGB;
++
++    if (!(dc = GetDC(hwnd)))
++    {
++        WARN("Failed to get target window DC.\n");
++        return;
++    }
++
++    SetStretchBltMode(dc, COLORONCOLOR);
++    if (StretchDIBits(dc, 0, 0, width, height, 0, 0, source_width, source_height,
++            pixels, &bmi, DIB_RGB_COLORS, SRCCOPY) == GDI_ERROR)
++        WARN("GDI presentation blit failed.\n");
++    else
++        TRACE("FMX_GDI_PRESENT hwnd %p source %ux%u destination %dx%d.\n",
++                hwnd, source_width, source_height, width, height);
++
++    ReleaseDC(hwnd, dc);
++}
++
++static LRESULT CALLBACK fmx_gdi_wndproc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
++{
++    LRESULT result;
++    struct fmx_window *state = GetPropW(hwnd, fmx_window_property);
++
++    if (!state)
++        return DefWindowProcW(hwnd, message, wparam, lparam);
++    ++state->callbacks;
++    result = CallWindowProcW(state->original_proc, hwnd, message, wparam, lparam);
++
++    if (message == WM_PAINT && !state->destroyed && !state->painting && state->frame
++            && fmx_gdi_present_enabled() && fmx_gdi_repaint_enabled())
++    {
++        state->painting = TRUE;
++        fmx_gdi_present(hwnd, state->width, state->height, state->frame);
++        state->painting = FALSE;
++        TRACE("FMX_GDI_REPAINT hwnd %p size %ux%u.\n", hwnd, state->width, state->height);
++    }
++    if (message == WM_TIMER && wparam == FMX_GDI_PRESENT_TIMER)
++    {
++        KillTimer(hwnd, FMX_GDI_PRESENT_TIMER);
++        if (state->present_pending && !state->destroyed && !state->painting && state->frame)
++        {
++            state->present_pending = FALSE;
++            state->painting = TRUE;
++            fmx_gdi_present(hwnd, state->width, state->height, state->frame);
++            state->painting = FALSE;
++            TRACE("FMX_GDI_PRESENT_SETTLED hwnd %p size %ux%u.\n", hwnd, state->width, state->height);
++        }
++        else
++            state->present_pending = FALSE;
++    }
++    if (message == WM_NCDESTROY)
++    {
++        if (state->present_pending)
++            KillTimer(hwnd, FMX_GDI_PRESENT_TIMER);
++        if ((WNDPROC)GetWindowLongPtrW(hwnd, GWLP_WNDPROC) == fmx_gdi_wndproc)
++            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)state->original_proc);
++        RemovePropW(hwnd, fmx_window_property);
++        state->destroyed = TRUE;
++        TRACE("FMX_GDI_DESTROY hwnd %p.\n", hwnd);
++    }
++    if (!--state->callbacks && state->destroyed)
++    {
++        HeapFree(GetProcessHeap(), 0, state->frame);
++        HeapFree(GetProcessHeap(), 0, state);
++    }
++
++    return result;
++}
++
++static struct fmx_window *fmx_gdi_install_wndproc(HWND hwnd)
++{
++    struct fmx_window *state;
++    if (!hwnd || GetWindowThreadProcessId(hwnd, NULL) != GetCurrentThreadId())
++        return NULL;
++    if ((state = GetPropW(hwnd, fmx_window_property)))
++        return state;
++    if (!(state = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*state))))
++        return NULL;
++    if (!SetPropW(hwnd, fmx_window_property, state))
++    {
++        HeapFree(GetProcessHeap(), 0, state);
++        return NULL;
++    }
++
++    state->original_proc = (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
++            (LONG_PTR)fmx_gdi_wndproc);
++    if (!state->original_proc)
++    {
++        RemovePropW(hwnd, fmx_window_property);
++        HeapFree(GetProcessHeap(), 0, state);
++        WARN("Failed to install GDI repaint window procedure for hwnd %p.\n", hwnd);
++        return NULL;
++    }
++    TRACE("FMX_GDI_SUBCLASS hwnd %p original %p.\n", hwnd, state->original_proc);
++    return state;
++}
++
++static BOOL fmx_gdi_store_frame(struct fmx_window *state, const struct wined3d_sub_resource_desc *desc,
++        const struct wined3d_map_desc *map_desc)
++{
++    SIZE_T row_size = (SIZE_T)desc->width * 4;
++    SIZE_T size = row_size * desc->height;
++    unsigned int y;
++
++    if (state->frame_size != size)
++    {
++        BYTE *frame = state->frame ? HeapReAlloc(GetProcessHeap(), 0, state->frame, size)
++                : HeapAlloc(GetProcessHeap(), 0, size);
++        if (!frame)
++            return FALSE;
++        state->frame = frame;
++        state->frame_size = size;
++    }
++
++    for (y = 0; y < desc->height; ++y)
++        memcpy(state->frame + y * row_size,
++                (const BYTE *)map_desc->data + y * map_desc->row_pitch, row_size);
++
++    state->width = desc->width;
++    state->height = desc->height;
++    return TRUE;
++}
+ 
+ static DXGI_SWAP_EFFECT dxgi_swap_effect_from_wined3d(enum wined3d_swap_effect swap_effect)
+ {
+@@ -129,7 +346,7 @@
+     IDXGIAdapter *adapter;
+     IDXGIOutput *output;
+     HMONITOR monitor;
+-    HRESULT hr;
++    HRESULT hr = E_FAIL;
+ 
+     if (!(monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST)))
+     {
+@@ -353,10 +570,151 @@
+ static HRESULT STDMETHODCALLTYPE DECLSPEC_HOTPATCH d3d11_swapchain_Present(IDXGISwapChain4 *iface, UINT sync_interval, UINT flags)
+ {
+     struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDXGISwapChain4(iface);
++    struct wined3d_texture *texture;
++    struct wined3d_resource *resource;
++    struct wined3d_resource_desc source_desc, staging_desc;
++    struct wined3d_device_context *context;
++    struct wined3d_sub_resource_desc desc;
++    struct wined3d_map_desc map_desc;
++    HWND hwnd = d3d11_swapchain_get_hwnd(swapchain);
++    struct fmx_window *window_state;
++    unsigned int x, y, samples = 0, nonzero = 0, min_rgb = 255, max_rgb = 0;
++    unsigned long long sum_rgb = 0;
++    BOOL staging_mapped = FALSE;
++    HRESULT hr = E_FAIL;
+ 
+     TRACE("iface %p, sync_interval %u, flags %#x.\n", iface, sync_interval, flags);
+ 
+-    return d3d11_swapchain_present(swapchain, sync_interval, flags);
++    /* Capture every submitted frame. Throttling here can discard the final
++     * redraw in a burst, leaving the settle timer to display an older frame
++     * indefinitely. The per-window timer already coalesces screen updates. */
++
++    texture = wined3d_swapchain_get_back_buffer(swapchain->wined3d_swapchain, 0);
++    resource = texture ? wined3d_texture_get_resource(texture) : NULL;
++    if (resource && SUCCEEDED(wined3d_resource_get_sub_resource_desc(resource, 0, &desc)))
++    {
++        wined3d_resource_get_desc(resource, &source_desc);
++        if (fmx_staging_texture && (fmx_staging_width != source_desc.width
++                || fmx_staging_height != source_desc.height || fmx_staging_format != source_desc.format
++                || fmx_staging_device != wined3d_swapchain_get_device(swapchain->wined3d_swapchain)))
++        {
++            wined3d_texture_decref(fmx_staging_texture);
++            fmx_staging_texture = NULL;
++            fmx_staging_resource = NULL;
++        }
++        if (!fmx_staging_texture)
++        {
++            fmx_staging_device = wined3d_swapchain_get_device(swapchain->wined3d_swapchain);
++            staging_desc = source_desc;
++            staging_desc.multisample_type = WINED3D_MULTISAMPLE_NONE;
++            staging_desc.multisample_quality = 0;
++            staging_desc.usage = 0;
++            staging_desc.bind_flags = 0;
++            staging_desc.access = WINED3D_RESOURCE_ACCESS_CPU | WINED3D_RESOURCE_ACCESS_MAP_R;
++            staging_desc.size = 0;
++            if (SUCCEEDED(hr = wined3d_texture_create(fmx_staging_device, &staging_desc, 1, 1, 0,
++                    NULL, NULL, &fmx_staging_parent_ops, &fmx_staging_texture)))
++            {
++                fmx_staging_resource = wined3d_texture_get_resource(fmx_staging_texture);
++                fmx_staging_width = source_desc.width;
++                fmx_staging_height = source_desc.height;
++                fmx_staging_format = source_desc.format;
++            }
++        }
++
++        if (fmx_staging_texture && fmx_staging_width == source_desc.width
++                && fmx_staging_height == source_desc.height && fmx_staging_format == source_desc.format)
++        {
++            context = wined3d_device_get_immediate_context(fmx_staging_device);
++            wined3d_device_context_copy_resource(context, fmx_staging_resource, resource);
++            if (SUCCEEDED(hr = wined3d_resource_map(fmx_staging_resource, 0, &map_desc, NULL, WINED3D_MAP_READ)))
++            {
++                for (y = 0; y < desc.height && samples < 4096; y += (desc.height / 32 + 1))
++                {
++                    const BYTE *row = (const BYTE *)map_desc.data + y * map_desc.row_pitch;
++                    for (x = 0; x < desc.width && samples < 4096; x += (desc.width / 32 + 1))
++                    {
++                        const BYTE *pixel = row + x * 4;
++                        unsigned int rgb = max(pixel[0], max(pixel[1], pixel[2]));
++                        min_rgb = min(min_rgb, rgb);
++                        max_rgb = max(max_rgb, rgb);
++                        sum_rgb += pixel[0] + pixel[1] + pixel[2];
++                        if (pixel[0] || pixel[1] || pixel[2] || pixel[3])
++                            ++nonzero;
++                        ++samples;
++                    }
++                }
++                staging_mapped = TRUE;
++                TRACE("FMX_BACKBUFFER_READ hr 0 size %ux%u pitch %u samples %u nonzero %u min_rgb %u max_rgb %u mean_rgb %.2f.\n",
++                        desc.width, desc.height, map_desc.row_pitch, samples, nonzero, min_rgb, max_rgb,
++                        samples ? (double)sum_rgb / (samples * 3) : 0.0);
++
++                if (fmx_backbuffer_dump_count < 8)
++                {
++                    FILE *file;
++                    char path[128];
++
++                    snprintf(path, sizeof(path), "Z:\\tmp\\rootsmagic-backbuffer-%02u.ppm", fmx_backbuffer_dump_count);
++                    if ((file = fopen(path, "wb")))
++                    {
++                        fprintf(file, "P6\n%u %u\n255\n", desc.width, desc.height);
++                        for (y = 0; y < desc.height; ++y)
++                        {
++                            const BYTE *row = (const BYTE *)map_desc.data + y * map_desc.row_pitch;
++
++                            for (x = 0; x < desc.width; ++x)
++                            {
++                                BYTE rgb[3] = {row[x * 4 + 2], row[x * 4 + 1], row[x * 4]};
++                                fwrite(rgb, sizeof(rgb), 1, file);
++                            }
++                        }
++                        fclose(file);
++                        ++fmx_backbuffer_dump_count;
++                        TRACE("FMX_BACKBUFFER_DUMP path %s.\n", path);
++                    }
++                    else
++                        WARN("Failed to open staging dump file.\n");
++                }
++            }
++        }
++    }
++    if (!samples)
++        TRACE("FMX_BACKBUFFER_READ hr %#lx resource %p.\n", hr, resource);
++
++    if (staging_mapped && fmx_gdi_present_enabled())
++    {
++        hwnd = d3d11_swapchain_get_hwnd(swapchain);
++        /* A click can briefly leave the staging texture completely black.
++         * Do not let that transient frame replace the last frame that was
++         * actually rendered; the resize path will provide a fresh good frame. */
++        if (nonzero > samples / 100)
++        {
++            if ((window_state = fmx_gdi_install_wndproc(hwnd)))
++                fmx_gdi_store_frame(window_state, &desc, &map_desc);
++        }
++        else if (nonzero <= samples / 100)
++            TRACE("FMX_GDI_RETAIN_BLACK size %ux%u samples %u nonzero %u.\n",
++                    desc.width, desc.height, samples, nonzero);
++    }
++
++    hr = d3d11_swapchain_present(swapchain, sync_interval, flags);
++    TRACE("FMX_PRESENT hr %#lx sync_interval %u flags %#x.\n", hr, sync_interval, flags);
++
++    if (fmx_gdi_present_enabled() && hwnd && (window_state = GetPropW(hwnd, fmx_window_property))
++            && window_state->frame)
++    {
++        ULONGLONG tick = GetTickCount64();
++        BOOL in_burst = tick - fmx_present_request_tick < FMX_GDI_PRESENT_BURST_WINDOW_MS;
++
++        fmx_present_request_tick = tick;
++        window_state->present_pending = TRUE;
++        SetTimer(hwnd, FMX_GDI_PRESENT_TIMER,
++                in_burst ? FMX_GDI_PRESENT_DEBOUNCE_BURST_MS : FMX_GDI_PRESENT_DEBOUNCE_IDLE_MS, NULL);
++    }
++    if (staging_mapped)
++        wined3d_resource_unmap(fmx_staging_resource, 0);
++
++    return hr;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetBuffer(IDXGISwapChain4 *iface,
